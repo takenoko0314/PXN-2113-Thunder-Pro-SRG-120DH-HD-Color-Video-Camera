@@ -1,0 +1,265 @@
+# インポート＝外部のデータを取り込み、自分のシステムやアプリケーションで扱える形式に変換して読み込む操作
+import sys                                                     # システム関連の操作（終了処理など）を行うためのモジュール
+import time                                                    # 時間に関する処理（待機など）を行うためのモジュール
+import pygame                                                  # ゲーム開発用ライブラリ。ここではジョイスティックの入力処理に使用
+import serial                                                  # シリアル通信を行うためのモジュール
+                                                               # カメラとのデータのやり取りに使う
+                                                               # シリアル通信とは、1本の回線を使ってデータを1ビットずつ順番に送受信する通信方式
+
+# グローバル変数：カメラの現在位置を記録する
+camera_pan = 0
+camera_tilt = 0
+camera_zoom = 0
+
+# パン・チルトの最大速度を設定（16進数表記。0x0Cは10進数で12、0x0Aは10進数で10）
+max_pan_speed = 0x0C                                           # 最大12
+max_tilt_speed = 0x0A                                          # 最大10
+
+# ボタン１〜１２のプリセットの定義：
+# 各プリセットのカメラ位置とズーム値をタプル (Pan, Tilt, Zoom) で表記する
+presets = {
+   0:  (0,     0,     13374),                                  # ボタン１　：十字架・スクリーン
+   1:  (4,     65301, 16704),                                  # ボタン２　：説教
+   2:  (0,     65376, 8999 ),                                  # ボタン３　：献金・祈り
+   3:  (65166, 65310, 16136),                                  # ボタン４　：司会
+   4:  (64594, 65272, 10488),                                  # ボタン５　：オルガン
+   5:  (0,     65474, 5058 ),                                  # ボタン６　：全体
+   6:  (20,    65115, 10923),                                  # ボタン７　：証詞
+   7:  (619,   65263, 10923),                                  # ボタン８　：プレイズ
+   8:  (64039, 64868, 5089 ),                                  # ボタン９　：ハンドベル
+   9:  (994,   65322, 14119),                                  # ボタン１０：洗礼槽
+   10: (484,   65336, 14615),                                  # ボタン１１：生け花
+   11: (0,     64828, 0    )                                   # ボタン１２：全席
+}
+
+# ハットスイッチのマッピング設定：
+# ハットスイッチの入力値 (hat_x, hat_y) に応じて、
+# 現在のプリセットから次に移動するべきプリセット番号を指定する
+hat_mappings = {
+   0 : {(0, -1):1,    (-1, -1):3,   (-1,  0):3,  ( 1, -1):9,   ( 1,  0):9},
+   1 : {(0,  1):0,    (-1,  0):3,   (-1, -1):4,  ( 0, -1):2,   ( 1, -1):7,   (1,  0):9},
+   2 : {(0,  1):1,    (-1,  1):3,   (-1,  0):4,  (-1, -1):4,   ( 0, -1):6,   (1,  0):7,   (1, -1):7,   (1, 1):9},
+   3 : {(0,  1):0,    (-1,  0):4,   (-1, -1):4,  ( 0, -1):2,   ( 1, -1):2,   (1,  0):1,   (1,  1):0},
+   4 : {(0,  1):3,    (-1,  0):8,   (-1, -1):8,  ( 0, -1):8,   ( 1, -1):2,   (1,  0):2,   (1,  1):3},
+   5 : {(0,  1):0,    (-1,  1):3,   (-1,  0):4,  (-1, -1):4,   ( 0, -1):1,   (1, -1):7,   (1,  0):10,  (1, 1):9},
+   6 : {(0,  1):1,    (-1,  1):3,   (-1,  0):4,  (-1, -1):4,   ( 0, -1):5,   (1, -1):7,   (1,  0):7,   (1, 1):9},
+   7 : {(0,  1):0,    (-1,  1):3,   (-1,  0):6,  (-1, -1):6,   ( 0, -1):5,   (1,  0):9,   (1,  1):9},
+   8 : {(0,  1):3,    ( 0, -1):5,   ( 1, -1):5,  ( 1,  0):3,   ( 1,  1):3},
+   9 : {(1,  0):9,    ( 0,  1):0,   (-1,  1):1,  (-1,  0):1,   (-1, -1):2,   (0, -1):7,   (1, -1):7},
+   10: {(0,  1):0,    (-1,  1):3,   (-1,  0):3,  (-1, -1):4,   ( 0, -1):5,   (1, -1):7,   (1,  0):7,   (1, 1):9},
+   11: {(0,  1):0,    (-1,  1):3,   (-1,  0):4,  (-1, -1):4,   ( 0, -1):2,   (1, -1):7,   (1,  0):7,   (1, 1):7}
+}
+
+# シリアル通信を初期化する
+# COM4ポートを使用し、通信速度は9600bps、タイムアウトは0.1秒に設定
+ser = serial.Serial("COM4", baudrate=9600, timeout=0.1)
+
+def send_visca(command):
+    try:
+        ser.reset_input_buffer()                               # 通信前に受信バッファをクリア（古いデータを捨てる）
+        ser.write(command)                                     # VISCAコマンド（カメラ操作命令）を送信
+        time.sleep(0.05)                                       # 応答待ちのために短時間待機
+        response = ser.read_all()                              # カメラからの全応答データを読み込む
+        if response.startswith(b'\x90\x60'):                   # 応答がエラーコードで始まっていた場合
+            print("[VISCA ERROR] Camera busy or invalid command.")
+    except Exception as e:
+        print(f"[VISCA ERROR] {str(e)}")                       # 例外が発生した場合、エラーメッセージを表示
+
+def inquiry_camera_position():
+    global camera_pan, camera_tilt, camera_zoom                # グローバル変数の更新を宣言
+    try:
+        # パン・チルト位置を問い合わせるためのVISCAコマンドを送信
+        ser.write(b'\x81\x09\x06\x12\xFF')
+        time.sleep(0.08)                                       # 応答を待つ
+        resp = ser.read_all()                                  # 応答データを受信
+        if len(resp) >= 11:                                    # 応答データが十分な長さであれば
+            # 受信したデータからパンの値を4つのニブルに分解して合成
+            pan = (resp[2] << 12) | (resp[3] << 8) | (resp[4] << 4) | resp[5]
+            # 同様にチルトの値を計算
+            tilt = (resp[6] << 12) | (resp[7] << 8) | (resp[8] << 4) | resp[9]
+            camera_pan, camera_tilt = pan, tilt                # グローバル変数を更新
+
+        # ズーム位置を問い合わせるためのVISCAコマンドを送信
+        ser.write(b'\x81\x09\x04\x47\xFF')
+        time.sleep(0.08)                                       # 応答待ち
+        zoom_resp = ser.read_all()                             # ズームの応答データを受信
+        if len(zoom_resp) >= 7:
+            # 受信したデータからズーム値を計算
+            zoom = (zoom_resp[2] << 12) | (zoom_resp[3] << 8) | (zoom_resp[4] << 4) | zoom_resp[5]
+            camera_zoom = zoom                                 # グローバル変数を更新
+    except:
+        pass  # 例外発生時は何もせずに処理を継続
+
+def set_zoom_direct(zoom_position):
+    global camera_pan, camera_tilt, camera_zoom                # 必要なグローバル変数を宣言
+    camera_zoom = zoom_position                                # 現在のズーム位置を更新
+    # ズーム位置の値を4つのニブルに分解する（VISCA命令に必要な形式）
+    z1 = (zoom_position >> 12) & 0x0F
+    z2 = (zoom_position >> 8) & 0x0F
+    z3 = (zoom_position >> 4) & 0x0F
+    z4 = zoom_position & 0x0F
+    # VISCAコマンドを作成（開始コード、命令コード、データ、終了コード）
+    cmd = bytes([0x81, 0x01, 0x04, 0x47, z1, z2, z3, z4, 0xFF])
+    send_visca(cmd)                                            # 作成したコマンドを送信
+
+def drive_pan_tilt(pan_speed, tilt_speed, pan_dir, tilt_dir):
+    # パン・チルト操作用のVISCAコマンドを作成する
+    cmd = bytes([
+        0x81, 0x01, 0x06, 0x01,                                # コマンドヘッダー
+        pan_speed & 0x0F, tilt_speed & 0x0F,                   # パン・チルト速度（下位4ビットのみ使用）
+        pan_dir, tilt_dir,                                     # 方向コード（例: 右=0x02, 左=0x01, 停止=0x03）
+        0xFF                                                   # 終了コード
+    ])
+    send_visca(cmd)                                            # コマンドを送信
+
+def move_camera_abs(pan, tilt, pan_speed=0x09, tilt_speed=0x09):
+    global camera_pan, camera_tilt
+    camera_pan = pan                                           # 新しいパン位置を保存
+    camera_tilt = tilt                                         # 新しいチルト位置を保存
+
+    # パン位置を4つのニブルに分解
+    p1 = (pan >> 12) & 0x0F
+    p2 = (pan >> 8) & 0x0F
+    p3 = (pan >> 4) & 0x0F
+    p4 = pan & 0x0F
+    # チルト位置を4つのニブルに分解
+    t1 = (tilt >> 12) & 0x0F
+    t2 = (tilt >> 8) & 0x0F
+    t3 = (tilt >> 4) & 0x0F
+    t4 = tilt & 0x0F
+
+    # 絶対位置移動用のVISCAコマンドを作成
+    cmd = bytes([
+        0x81, 0x01, 0x06, 0x02,                                # 絶対移動を意味するヘッダー
+        pan_speed & 0x0F, tilt_speed & 0x0F,                   # 移動速度
+        p1, p2, p3, p4,                                        # パン位置の4ニブル
+        t1, t2, t3, t4,                                        # チルト位置の4ニブル
+        0xFF                                                   # 終了コード
+    ])
+    send_visca(cmd)  # コマンド送信
+
+def move_to_preset(preset_id):
+    if preset_id not in presets:
+        return                                                 # 指定されたプリセットが存在しない場合は処理を中断
+    global camera_pan, camera_tilt, camera_zoom
+    p, t, z = presets[preset_id]                               # プリセットからパン、チルト、ズームの値を取り出す
+    move_camera_abs(p, t, 0x09, 0x09)                          # 絶対位置へ移動するためのコマンドを送信
+    set_zoom_direct(z)                                         # ズーム位置を直接設定するコマンドを送信
+    inquiry_camera_position()                                  # カメラの最新位置を問い合わせ、グローバル変数を更新
+
+def set_af_sensitivity_low():
+    # オートフォーカス感度を低く設定するVISCAコマンドを送信する
+    send_visca(b'\x81\x01\x04\x58\x03\xFF')
+
+def get_closest_preset(pan, tilt, zoom):
+    """
+    # 現在のカメラのパン、チルト、ズーム値に最も近いプリセット番号を返す関数
+    # ズームの差には0.02の係数をかけて影響を小さくしている
+    """
+    best_id = None                                             # 最も近いプリセット番号の初期化
+    best_dist = None                                           # 差の二乗の和の最小値を初期化
+    for pid, (pp, pt, pz) in presets.items():
+        pan_diff = (pp - pan)                                  # 現在のパンとの差
+        tilt_diff = (pt - tilt)                                # 現在のチルトとの差
+        zoom_diff = (pz - zoom)                                # 現在のズームとの差
+        # パンとチルトの差の二乗と、ズーム差の二乗に0.02の係数をかけた値の和
+        dist = (pan_diff**2) + (tilt_diff**2) + 0.02 * (zoom_diff**2)
+
+        if best_dist is None or dist < best_dist:
+            best_dist = dist                                   # 最小値を更新
+            best_id = pid                                      # 一番近いプリセット番号を更新
+
+    return best_id                                             # もっとも近いプリセット番号を返す
+
+def main():
+    global camera_pan, camera_tilt, camera_zoom
+    set_af_sensitivity_low()                                   # オートフォーカス感度を低く設定する
+
+    pygame.init()                                              # pygameライブラリを初期化
+    pygame.joystick.init()                                     # ジョイスティックの入力処理を初期化
+    joystick = pygame.joystick.Joystick(0)                     # 最初に接続されているジョイスティックを取得
+    joystick.init()                                            # ジョイスティックを初期化
+
+    # プログラム開始時にスロットルレバーの初期値を読み取る
+    pygame.event.pump()                                        # 最新のイベント情報を取得
+    initial_throttle = joystick.get_axis(2)                    # スロットルレバーの値を取得
+    throttle_normalized = (1.0 - initial_throttle) / 2.0       # 取得値を0～1の範囲に正規化
+    initial_zoom_position = int(throttle_normalized * 0x4000)  # ズーム位置として換算（最大値0x4000）
+
+    # カメラの初期位置をプリセット0にセットする
+    move_to_preset(0)
+
+    prev_x, prev_y = 0, 0                                      # ジョイスティック軸の前回の値を初期化
+    prev_throttle_val = initial_zoom_position                  # 前回のズーム位置として初期値を保存
+
+    try:
+        while True:
+            pygame.event.pump()                                # イベント情報を更新
+            x = joystick.get_axis(0)                           # 横軸（パン操作）の値を取得
+            y = joystick.get_axis(1)                           # 縦軸（チルト操作）の値を取得
+            throttle = joystick.get_axis(2)                    # スロットルレバー（ズーム操作）の値を取得
+
+            # パン操作の速度と方向を決定する
+            if abs(x) > 0.1:                                   # 小さすぎる動きは無視（ノイズ除去）
+                if x > 0.1:
+                    pan_dir = 0x02                             # 右方向
+                    pan_speed = min(int(abs(x) * max_pan_speed * 1.1), max_pan_speed)
+                else:
+                    pan_dir = 0x01                             # 左方向
+                    pan_speed = min(int(abs(x) * max_pan_speed), max_pan_speed)
+            else:
+                pan_dir = 0x03                                 # 動かさない（中立）
+                pan_speed = 0
+
+            # チルト操作の速度と方向を決定する
+            if y > 0.2:
+                tilt_dir = 0x02                                # 上方向
+                tilt_speed = min(int(abs(y) * max_tilt_speed), max_tilt_speed)
+            elif y < -0.2:
+                tilt_dir = 0x01                                # 下方向
+                tilt_speed = min(int(abs(y) * max_tilt_speed), max_tilt_speed)
+            else:
+                tilt_dir = 0x03                                # 動かさない（中立）
+                tilt_speed = 0
+
+            # ジョイスティックの動きが前回と大きく変わった場合のみパン・チルト命令を送信する
+            if (abs(x - prev_x) > 0.01) or (abs(y - prev_y) > 0.01):
+                drive_pan_tilt(pan_speed, tilt_speed, pan_dir, tilt_dir)
+                prev_x, prev_y = x, y                          # 現在の軸の値を保存
+
+            # スロットルレバーの値からズーム位置を算出し、変化が大きければ更新する
+            throttle_normalized = (1.0 - throttle) / 2.0       # 0～1の範囲に正規化
+            zoom_position = int(throttle_normalized * 0x4000)  # ズーム位置に換算
+            if abs(zoom_position - prev_throttle_val) > 50:    # 閾値（50）を超える変化があれば
+                set_zoom_direct(zoom_position)                 # ズーム位置更新のコマンドを送信
+                prev_throttle_val = zoom_position              # 現在のズーム位置を保存
+
+            # プリセットボタン（0～11）の入力を監視する
+            for btn_id in range(12):
+                if joystick.get_button(btn_id):
+                    move_to_preset(btn_id)                     # 該当するプリセットに移動
+                    break                                      # 一度押されたらループを抜ける
+
+            # ハットスイッチ（方向パッド）の入力を取得
+            hat_x, hat_y = joystick.get_hat(0)
+            if (hat_x, hat_y) != (0, 0):                       # 何らかの方向入力があれば
+                current_preset = get_closest_preset(camera_pan, camera_tilt, camera_zoom)
+                if current_preset in hat_mappings:
+                    if (hat_x, hat_y) in hat_mappings[current_preset]:
+                        new_preset = hat_mappings[current_preset][(hat_x, hat_y)]
+                        move_to_preset(new_preset)             # ハットスイッチの方向に応じたプリセットに移動
+
+            # 定期的にカメラの現在位置を問い合わせ、グローバル変数を更新する
+            inquiry_camera_position()
+            time.sleep(0.05)                                   # ループの間隔を短くあけて負荷を軽減
+
+    except KeyboardInterrupt:
+        pass                                                   # Ctrl+Cなどでプログラム終了された場合は何もせずに抜ける
+    finally:
+        joystick.quit()                                        # ジョイスティックの使用を終了
+        pygame.quit()                                          # pygameの終了処理を行う
+        ser.close()                                            # シリアル通信を閉じる
+        sys.exit()                                             # プログラムを終了する
+
+if __name__ == '__main__':
+    main()                                                     # このスクリプトが直接実行されたときにmain()関数を呼び出す
